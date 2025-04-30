@@ -21,10 +21,10 @@ CLONED_AUDIO_DIR = "miner_cloned_voices"
 os.makedirs(CLONED_AUDIO_DIR, exist_ok=True)  # Ensure the directory exists
 
 # Configuration constants
-QUALITY_WEIGHT = 0.5  
-LATENCY_WEIGHT = 0.5  
-QUALITY_THRESHOLD = 0.3  
-TARGET_LATENCY = 10.0  
+QUALITY_WEIGHT = 0.5  # Weight for quality component
+LATENCY_WEIGHT = 0.5  # Weight for latency component
+QUALITY_THRESHOLD = 0.3  # Minimum quality score to receive full latency reward
+TARGET_LATENCY = 10.0  # Target latency in seconds for normalization
 
 # ---------------------------
 # Model Loading Functions
@@ -158,12 +158,12 @@ def calculate_latency_score(
     if processing_time <= 0:
         return 0.0
         
-    # Normalize processing time by response size 
+    # Normalize processing time by response size (larger responses take longer to transmit)
     size_kb = max(1, response_size / 1024)  # Ensure at least 1KB to avoid division by zero
     size_factor = 1.0 + 0.1 * math.log(size_kb)  # Logarithmic scaling for file size
     normalized_time = processing_time / size_factor
     
-    # Calculate relative score 
+    # Calculate relative score (how this miner compares to others in the batch)
     relative_score = 0.0
     if max_time > min_time:
         relative_score = 1.0 - ((normalized_time - min_time) / (max_time - min_time))
@@ -171,10 +171,10 @@ def calculate_latency_score(
     else:
         relative_score = 1.0  # If all times are the same
         
-    # Calculate absolute score 
+    # Calculate absolute score (reward based on absolute performance)
     absolute_score = math.exp(-normalized_time / TARGET_LATENCY)
     
-    # Combined score 
+    # Combined score (70% relative, 30% absolute)
     return 0.7 * relative_score + 0.3 * absolute_score
 
 def evaluate_cloned_audio(
@@ -204,7 +204,7 @@ def evaluate_cloned_audio(
     difference = compare_mean_pitch(reference_path, cloned_path)
     pitch_score = pitch_diff_to_similarity(difference)
     
-    # Combined quality score 
+    # Combined quality score (weighted average)
     quality_score = (0.4 * voice_score) + (0.3 * pitch_score) + (0.3 * text_score)
     
     # Create dictionary of component scores for logging
@@ -228,6 +228,7 @@ def get_clone_rewards(
 ) -> np.ndarray:
     """
     Evaluate miner responses with both quality and latency metrics.
+    The final reward will be redistributed by rank in the validator.
     
     Args:
         clip_audio_path: Path to reference audio
@@ -324,7 +325,7 @@ def get_clone_rewards(
                 f"Size: {response_sizes.get(uid, 0)} bytes)"
             )
     
-    # Calculate final rewards
+    # Calculate final rewards - combined quality and latency scores
     for idx in range(len(responses)):
         # Combined score with equal weighting for quality and latency
         final_rewards[idx] = (QUALITY_WEIGHT * quality_scores[idx]) + (LATENCY_WEIGHT * latency_scores[idx])

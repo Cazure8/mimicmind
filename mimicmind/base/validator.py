@@ -25,7 +25,7 @@ import bittensor as bt
 import numpy as np
 import argparse
 
-from typing import List, Union, Dict, Any
+from typing import List, Union, Dict, Any, Tuple
 from traceback import print_exception
 
 from mimicmind.utils.misc import update_repository
@@ -282,7 +282,7 @@ class BaseValidatorNeuron(BaseNeuron):
                 self.scores[uid] = 0  # hotkey has been replaced
 
         # Check to see if the metagraph has changed size.
-        # If so, we need to add new hotkeys and moving averages.
+        # add new hotkeys and moving averages.
         if len(self.hotkeys) < len(self.metagraph.hotkeys):
             # Update the size of the moving average scores.
             new_moving_average = np.zeros((self.metagraph.n))
@@ -293,9 +293,99 @@ class BaseValidatorNeuron(BaseNeuron):
         # Update the hotkeys.
         self.hotkeys = copy.deepcopy(self.metagraph.hotkeys)
 
+    def redistribute_rewards_by_rank(self, rewards: np.ndarray, uids: np.ndarray) -> Tuple[np.ndarray, Dict]:
+        """
+        Redistributes rewards based on performance ranking:
+        - 1st place: 50% of rewards
+        - 2nd place: 25% of rewards
+        - 3rd place: 15% of rewards
+        - Remaining miners: Share 10% of rewards proportionally
+        
+        Args:
+            rewards: Original reward values
+            uids: Corresponding UIDs for each reward
+            
+        Returns:
+            Tuple containing redistributed rewards array and rank information dictionary
+        """
+        # Handle edge cases
+        if len(rewards) == 0:
+            return rewards, {}
+            
+        if len(rewards) == 1:
+            return np.array([1.0]), {"ranks": {int(uids[0]): 1}}
+        
+        # Pair UIDs with their rewards for sorting
+        uid_reward_pairs = [(uid, reward) for uid, reward in zip(uids, rewards)]
+        
+        # Sort by reward in descending order
+        sorted_pairs = sorted(uid_reward_pairs, key=lambda x: x[1], reverse=True)
+        sorted_uids = [pair[0] for pair in sorted_pairs]
+        sorted_rewards = [pair[1] for pair in sorted_pairs]
+        
+        # Initialize redistributed rewards
+        redistributed = np.zeros_like(rewards)
+        rank_info = {"ranks": {}, "original_rewards": {}, "new_rewards": {}}
+        
+        # Create a mapping from original index to sorted index
+        uid_to_index = {uid: i for i, uid in enumerate(uids)}
+        
+        # Set up the tiered distribution percentages
+        total_reward = 1.0  
+        tier_percentages = [0.5, 0.25, 0.15]  
+        
+        # Distribute rewards for top 3 positions 
+        for rank, percentage in enumerate(tier_percentages):
+            if rank < len(sorted_uids):
+                uid = sorted_uids[rank]
+                original_idx = uid_to_index[uid]
+                redistributed[original_idx] = total_reward * percentage
+                
+                # Store info for logging
+                rank_info["ranks"][int(uid)] = rank + 1
+                rank_info["original_rewards"][int(uid)] = float(rewards[original_idx])
+                rank_info["new_rewards"][int(uid)] = float(redistributed[original_idx])
+        
+        # Calculate remaining reward pool 
+        remaining_pool = total_reward * 0.1
+        
+        # Handle remaining miners 
+        if len(sorted_uids) > 3:
+            remaining_uids = sorted_uids[3:]
+            remaining_rewards = sorted_rewards[3:]
+            
+            # Normalize remaining original rewards for proportional distribution
+            total_remaining_original = sum(remaining_rewards)
+            
+            # Distribute remaining 10% pool proportionally
+            if total_remaining_original > 0:
+                for uid, reward in zip(remaining_uids, remaining_rewards):
+                    original_idx = uid_to_index[uid]
+                    proportion = reward / total_remaining_original
+                    redistributed[original_idx] = remaining_pool * proportion
+                    
+                    # Store info for logging
+                    rank_info["ranks"][int(uid)] = "shared pool"  # Not a numbered rank
+                    rank_info["original_rewards"][int(uid)] = float(rewards[original_idx])
+                    rank_info["new_rewards"][int(uid)] = float(redistributed[original_idx])
+            else:
+                # If all remaining rewards are 0, distribute equally
+                equal_share = remaining_pool / len(remaining_uids) if len(remaining_uids) > 0 else 0
+                for uid in remaining_uids:
+                    original_idx = uid_to_index[uid]
+                    redistributed[original_idx] = equal_share
+                    
+                    # Store info for logging
+                    rank_info["ranks"][int(uid)] = "shared pool"
+                    rank_info["original_rewards"][int(uid)] = float(rewards[original_idx])
+                    rank_info["new_rewards"][int(uid)] = float(redistributed[original_idx])
+        
+        return redistributed, rank_info
+
     def update_scores(self, rewards: np.ndarray, uids: List[int]):
         """
         Performs exponential moving average on the scores based on the rewards received from the miners.
+        Redistributes rewards based on performance ranking before updating scores.
         Also tracks performance history for analytics and anti-gaming mechanisms.
         """
         bt.logging.info("Updating scores with new rewards")
@@ -329,12 +419,32 @@ class BaseValidatorNeuron(BaseNeuron):
                 f"Shape mismatch: rewards array of shape {rewards.shape} "
                 f"cannot be broadcast to uids array of shape {uids_array.shape}"
             )
+        
+        # Log original rewards for reference
+        bt.logging.info("Original rewards: " + ", ".join([f"UID {uid}: {reward:.4f}" for uid, reward in zip(uids_array, rewards)]))
+        
+        # Redistribute rewards according to ranking
+        redistributed_rewards, rank_info = self.redistribute_rewards_by_rank(rewards, uids_array)
+        
+        # Log redistributed rewards
+        bt.logging.info("===== PERFORMANCE RANKING =====")
+        for uid, rank in sorted(rank_info["ranks"].items(), key=lambda x: x[1] if isinstance(x[1], int) else 999):
+            if isinstance(rank, int):
+                bt.logging.info(f"Rank #{rank}: UID {uid} - Original: {rank_info['original_rewards'][uid]:.4f}, New: {rank_info['new_rewards'][uid]:.4f}")
+        
+        if "shared pool" in rank_info["ranks"].values():
+            bt.logging.info("--- Shared Pool (10%) ---")
+            for uid, rank in rank_info["ranks"].items():
+                if rank == "shared pool":
+                    bt.logging.info(f"UID {uid} - Original: {rank_info['original_rewards'][uid]:.4f}, New: {rank_info['new_rewards'][uid]:.4f}")
+        bt.logging.info("=============================")
             
         # Record performance in history for analytics and anti-gaming
         timestamp = asyncio.get_event_loop().time()
         for i, uid in enumerate(uids_array):
             uid_int = int(uid)
-            reward = float(rewards[i])
+            original_reward = float(rewards[i])
+            redistributed_reward = float(redistributed_rewards[i])
             
             # Initialize history for this uid if not exists
             if uid_int not in self.performance_history:
@@ -343,7 +453,9 @@ class BaseValidatorNeuron(BaseNeuron):
             # Add performance data
             performance_data = {
                 "timestamp": timestamp,
-                "reward": reward,
+                "original_reward": original_reward,
+                "redistributed_reward": redistributed_reward,
+                "rank": rank_info["ranks"].get(uid_int, "unranked"),
                 "step": self.step
             }
             
@@ -352,9 +464,9 @@ class BaseValidatorNeuron(BaseNeuron):
             if len(self.performance_history[uid_int]) > self.history_size:
                 self.performance_history[uid_int] = self.performance_history[uid_int][-self.history_size:]
         
-        # Compute forward pass rewards, assumes uids are mutually exclusive.
+        # Compute forward pass rewards using redistributed rewards, assumes uids are mutually exclusive.
         scattered_rewards = np.zeros_like(self.scores)
-        scattered_rewards[uids_array] = rewards
+        scattered_rewards[uids_array] = redistributed_rewards
 
         alpha = self.config.neuron.moving_average_alpha
 
@@ -375,7 +487,7 @@ class BaseValidatorNeuron(BaseNeuron):
         
         # Save performance history to a JSON file 
         try:
-            # Convert keys to strings (JSON requires string keys)
+            # Convert keys to strings 
             history_dict = {str(k): v for k, v in self.performance_history.items()}
             
             with open(os.path.join(self.config.neuron.full_path, "performance_history.json"), "w") as f:

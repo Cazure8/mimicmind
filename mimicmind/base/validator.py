@@ -1,5 +1,5 @@
 # The MIT License (MIT)
-# Copyright © 2025 Cazure
+# Copyright © 2025 Your Name
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
 # documentation files (the "Software"), to deal in the Software without restriction, including without limitation
@@ -19,11 +19,13 @@
 import copy
 import asyncio
 import threading
+import json
+import os
 import bittensor as bt
 import numpy as np
 import argparse
 
-from typing import List, Union
+from typing import List, Union, Dict, Any
 from traceback import print_exception
 
 from mimicmind.utils.misc import update_repository
@@ -56,6 +58,10 @@ class BaseValidatorNeuron(BaseNeuron):
         # Set up initial scoring weights for validation
         bt.logging.info("Building validation weights.")
         self.scores = np.zeros(self.metagraph.n, dtype=np.float32)
+        
+        # Initialize performance history for tracking miner performance over time
+        self.performance_history: Dict[int, List[Dict[str, Any]]] = {}
+        self.history_size = 100  # Maximum records per miner
         
         # Init sync with the network. Updates the metagraph.
         self.sync()
@@ -99,6 +105,7 @@ class BaseValidatorNeuron(BaseNeuron):
             pass
 
     async def concurrent_forward(self):
+        """Run multiple forward passes concurrently."""
         coroutines = [
             self.forward() for _ in range(self.config.neuron.num_concurrent_forwards)
         ]
@@ -196,6 +203,8 @@ class BaseValidatorNeuron(BaseNeuron):
             bt.logging.warning(
                 f"Scores contain NaN values. This may be due to a lack of responses from miners, or a bug in your reward functions."
             )
+            # Replace NaN with zeros
+            self.scores = np.nan_to_num(self.scores, nan=0.0)
 
         # Compute the norm of the scores
         norm = np.linalg.norm(self.scores, ord=1, axis=0, keepdims=True)
@@ -209,6 +218,7 @@ class BaseValidatorNeuron(BaseNeuron):
 
         bt.logging.debug("raw_weights", raw_weights)
         bt.logging.debug("raw_weight_uids", str(self.metagraph.uids.tolist()))
+        
         # Process the raw weights to final_weights via subtensor limitations.
         (
             processed_weight_uids,
@@ -284,8 +294,12 @@ class BaseValidatorNeuron(BaseNeuron):
         self.hotkeys = copy.deepcopy(self.metagraph.hotkeys)
 
     def update_scores(self, rewards: np.ndarray, uids: List[int]):
-        """Performs exponential moving average on the scores based on the rewards received from the miners."""
-        print("-----we are updating scores-----")
+        """
+        Performs exponential moving average on the scores based on the rewards received from the miners.
+        Also tracks performance history for analytics and anti-gaming mechanisms.
+        """
+        bt.logging.info("Updating scores with new rewards")
+        
         # Check if rewards contains NaN values.
         if np.isnan(rewards).any():
             bt.logging.warning(f"NaN values detected in rewards: {rewards}")
@@ -294,7 +308,7 @@ class BaseValidatorNeuron(BaseNeuron):
 
         # Ensure rewards is a numpy array.
         rewards = np.asarray(rewards)
-        print(f"rewards: {rewards}")
+        
         # Check if `uids` is already a numpy array and copy it to avoid the warning.
         if isinstance(uids, np.ndarray):
             uids_array = uids.copy()
@@ -316,16 +330,36 @@ class BaseValidatorNeuron(BaseNeuron):
                 f"cannot be broadcast to uids array of shape {uids_array.shape}"
             )
             
+        # Record performance in history for analytics and anti-gaming
+        timestamp = asyncio.get_event_loop().time()
+        for i, uid in enumerate(uids_array):
+            uid_int = int(uid)
+            reward = float(rewards[i])
+            
+            # Initialize history for this uid if not exists
+            if uid_int not in self.performance_history:
+                self.performance_history[uid_int] = []
+                
+            # Add performance data
+            performance_data = {
+                "timestamp": timestamp,
+                "reward": reward,
+                "step": self.step
+            }
+            
+            # Append new data and trim if needed
+            self.performance_history[uid_int].append(performance_data)
+            if len(self.performance_history[uid_int]) > self.history_size:
+                self.performance_history[uid_int] = self.performance_history[uid_int][-self.history_size:]
+        
         # Compute forward pass rewards, assumes uids are mutually exclusive.
-        scattered_rewards: np.ndarray = np.zeros_like(self.scores)
+        scattered_rewards = np.zeros_like(self.scores)
         scattered_rewards[uids_array] = rewards
 
-        alpha: float = self.config.neuron.moving_average_alpha
+        alpha = self.config.neuron.moving_average_alpha
 
-        self.scores: np.ndarray = (
-            alpha * scattered_rewards + (1 - alpha) * self.scores
-        )
-        bt.logging.debug(f"*****************Updated moving avg scores: {self.scores}")
+        self.scores = (alpha * scattered_rewards) + (1 - alpha) * self.scores
+        bt.logging.debug(f"Updated moving avg scores: {self.scores}")
 
     def save_state(self):
         """Saves the state of the validator to a file."""
@@ -338,13 +372,34 @@ class BaseValidatorNeuron(BaseNeuron):
             scores=self.scores,
             hotkeys=self.hotkeys,
         )
+        
+        # Save performance history to a JSON file 
+        try:
+            # Convert keys to strings (JSON requires string keys)
+            history_dict = {str(k): v for k, v in self.performance_history.items()}
+            
+            with open(os.path.join(self.config.neuron.full_path, "performance_history.json"), "w") as f:
+                json.dump(history_dict, f)
+        except Exception as e:
+            bt.logging.warning(f"Failed to save performance history: {e}")
 
     def load_state(self):
         """Loads the state of the validator from a file."""
         bt.logging.info("Loading validator state.")
 
-        # Load the state of the validator from file.
-        state = np.load(self.config.neuron.full_path + "/state.npz")
-        self.step = state["step"]
-        self.scores = state["scores"]
-        self.hotkeys = state["hotkeys"]
+        try:
+            # Load the state of the validator from file.
+            state = np.load(self.config.neuron.full_path + "/state.npz", allow_pickle=True)
+            self.step = state["step"]
+            self.scores = state["scores"]
+            self.hotkeys = state["hotkeys"]
+            
+            # Try to load performance history
+            history_path = os.path.join(self.config.neuron.full_path, "performance_history.json")
+            if os.path.exists(history_path):
+                with open(history_path, "r") as f:
+                    history_dict = json.load(f)
+                    # Convert keys back to integers
+                    self.performance_history = {int(k): v for k, v in history_dict.items()}
+        except Exception as e:
+            bt.logging.warning(f"Failed to load state: {e}. Starting with a fresh state.")
